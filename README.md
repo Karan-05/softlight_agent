@@ -191,7 +191,9 @@ No workflows are hardcoded—the agent always consumes `--task` at runtime. Beca
 
 ---
 
-## License
-MIT License © Softlight Engineering. Use responsibly; never commit secrets, storage-state files, or raw customer datasets to the repository.
+## Personal Note:
+I’m genuinely excited about this challenge and the opportunity to work with the Softlight team. It sits in the perfect intersection of what I love building: high-leverage systems, real-time automation, and intelligent tooling that makes complex workflows feel effortless. Over the past few years I’ve shipped production-grade platforms across infra, data, AI, and full-stack product — from low-latency systems and containerized backends to retrieval and analytics tooling — and this assignment feels like a natural extension of that work: robust engineering + ML-driven reasoning + delightful UX for other agents and humans. 
 
-Agent B is intentionally app-agnostic—every improvement should continue to rely on live UISnapshots and natural-language instructions rather than hardcoded flows. Hook it up to Agent A, point it at a new workflow, and you’ll get the screenshots, actions, and metadata needed to teach the rest of your agent stack.
+What excites me most is Softlight’s focus on real, working systems over just “demo AI.” This project is exactly that: an autonomous, explainable agent that can generalize across products, navigate messy UIs, and reliably capture the right states without brittle hardcoding. It’s the kind of problem where strong fundamentals, meticulous debugging, and product empathy actually matter — and that’s how I like to operate.
+
+I’m looking forward to the chance to collaborate with the team, go deep on this problem space, and help build tools that other engineers and agents can rely on in production.
