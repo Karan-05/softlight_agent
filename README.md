@@ -1,199 +1,501 @@
 # Agent B – UI Workflow Capture Agent
+
 *Softlight Engineering Take-Home Assignment – UI Workflow Capture Agent (Agent B)*
 
 ---
 
 ## Overview
-Agent B collaborates with other members of Softlight’s multi-agent system. Agent A receives natural-language questions (“How do I create a project in Linear?”) and delegates them to Agent B. Agent B interprets the instruction, drives a real browser via Playwright + an LLM planner, captures every important UI state (including modals and confirmation banners that never change the URL), and emits a structured dataset that teaches downstream agents or humans how to complete the workflow.
+
+This repository implements **Agent B**, part of a multi-agent system:
+
+* **Agent A** receives natural language questions, e.g.:
+
+  * “How do I create a project in Linear?”
+  * “How do I filter a database in Notion?”
+* **Agent B (this project)**:
+
+  * Interprets the task
+  * Drives a real browser using **Playwright** + an **LLM-driven planner**
+  * Navigates the live app (Linear, Notion)
+  * Captures **each important UI state** in the workflow:
+
+    * URL states (e.g. list pages)
+    * Non-URL states (modals, drawers, inline forms, confirmation banners)
+  * Emits a structured dataset (`run.jsonl` + screenshots + DOM summaries) that shows how to perform the workflow end-to-end
+
+The system is **not hardcoded** to specific flows. It uses generic perception + planning + execution so it can adapt to new tasks and different web apps at runtime.
 
 ---
 
 ## Key Features
-- **LLM Planner** – Strict JSON schema, robust selector guidance, loop-safe reasoning, and capture hints for all key states.
-- **Playwright Executor** – Sync Playwright driver that validates visibility, handles retries/timeouts, and converts actions to real DOM operations.
-- **Non-URL Capture** – Records entry pages, controls, modals/forms, populated inputs, success views—everything Agent A needs to replicate the workflow.
-- **Dataset Generation** – Saves sequential screenshots, DOM summaries, and `run.jsonl` telemetry under `captures/<task>/`.
-- **Guardrails** – Per-action timeouts, repeated-action detection, selector validation, and “never paste the prompt” policies keep the system reliable.
+
+* **Natural-Language → Actions**
+
+  * Consumes tasks like:
+    `--task "Create a new project in Linear with a random title"`
+  * Infers intent (create, open, filter, toggle, search, etc.) from text.
+
+* **UI Perception (Non-URL States Included)**
+
+  * Captures:
+
+    * Entry pages
+    * Primary buttons and CTAs
+    * Modals and drawers
+    * Filled form states
+    * Success / confirmation states
+  * Works even when the URL doesn’t change.
+
+* **LLM + Heuristic Planner**
+
+  * LLM planner operates under a strict JSON schema.
+  * Heuristic planner handles common patterns (“Create”, “New”, “Filter”, “Settings”) safely.
+  * Both are constrained to selectors observed in the current DOM snapshot.
+
+* **Robust Playwright Executor**
+
+  * Validates visibility, waits for stability.
+  * Retries on timeouts.
+  * Operates only on validated selectors.
+  * Captures screenshots and HTML when key states are reached.
+
+* **Guardrails & Safety**
+
+  * Prevents:
+
+    * Pasting prompts into inputs
+    * Loops of repeated actions
+    * Clicking dismiss/cancel for creation flows
+    * Using selectors that don’t exist in the latest snapshot
+
+* **Dataset Generation**
+
+  * Each run produces:
+
+    * `run.jsonl` timeline (snapshots → plans → actions → outcomes)
+    * Step-wise screenshots
+    * DOM summaries / metadata
+  * Organized **by task**, ready for inspection or training.
 
 ---
 
 ## Architecture
+
+At a high level:
+
+```text
+src/
+  main.py                 # CLI entrypoint
+  agent_b/
+    runner.py             # Orchestrates the agent loop
+    ui_describer.py       # DOM → structured UI elements
+    hierarchical_planner.py
+    llm_planner.py
+    heuristic_planner.py
+    planning_validation.py
+    executor.py
+    success.py
+    plan_memory.py
+    experience_store.py
+    semantic_index.py
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                          Agent B                              │
-├──────────────────────┬────────────────────────┬───────────────┤
-│ Context Extractor    │ Planner                │ Executor      │
-│ (src/agent/context.py│ (src/agent/planner.py) │ (src/agent/   │
-│ + Playwright DOM     │ • strict system prompt │ executor.py)  │
-│ snapshot)            │ • JSON-only actions    │ • Playwright   │
-│ • URL/title/modals   │ • capture recommendations│ ops + waits  │
-│ • Clickables/inputs  │ • guardrails + retries │ • success/fail │
-├──────────────────────┴────────────────────────┴───────────────┤
-│ Run Logger & Dataset (src/agent/run_logger.py)                │
-│ • logs/agent-<ts>.log + logs/run-<ts>.jsonl                   │
-│ • captures/<slug>/<step>-<capture>.png                        │
-│ • Combined trace feeds Agent A and future training pipelines  │
-└───────────────────────────────────────────────────────────────┘
+
+### Flow
+
+1. **Entrypoint (`src/main.py`)**
+
+   * Parses:
+
+     * `--task` (natural language)
+     * `--app` (e.g. `linear`, `notion`)
+     * `--storage-state` (Playwright auth)
+     * `--max-steps`, `--timeout-ms`, `--browser`
+   * Calls the runner with these settings.
+
+2. **Runner (`agent_b/runner.py`)**
+
+   * Starts Playwright (Firefox).
+   * Loads authenticated session (`--storage-state`).
+   * For each step:
+
+     * Ask `ui_describer` for a snapshot.
+     * Call planners to choose the next action.
+     * Validate, execute, and log.
+     * Check success / stopping conditions.
+
+3. **Perception (`agent_b/ui_describer.py`)**
+
+   * Builds a **UISnapshot**:
+
+     * Clickables, inputs, modals, primary actions
+     * Roles, labels, text, selectors
+   * Normalizes into `UIElement` objects, which are the only things planners can target.
+
+4. **Planning**
+
+   * **Hierarchical Planner**
+
+     * Coordinates:
+
+       * Previously successful plans (from memory)
+       * LLM proposals
+       * Heuristic fallbacks
+     * Ensures each suggestion goes through validation.
+   * **LLM Planner**
+
+     * Given:
+
+       * Task text
+       * Current snapshot
+       * Recent history
+     * Returns a **single JSON action** or short script:
+
+       * `action`, `selector`, `value`, `capture_name`, `reason`, `expect`, `success_hint`
+     * Must reuse selectors from the snapshot (no hallucinated CSS).
+   * **Heuristic Planner**
+
+     * Pattern-matches common UI flows:
+
+       * “Create / New / Add / Save”
+       * Filters, search, toggles
+       * Modals and submit buttons
+     * Used when the LLM is unnecessary or ambiguous.
+
+5. **Validation (`agent_b/planning_validation.py`)**
+
+   * Ensures:
+
+     * Selector exists in latest snapshot.
+     * Action fits the role (e.g. `fill` on input only).
+     * Task intent and element text don’t conflict (e.g. project vs issue).
+     * Creation flows avoid dismiss / cancel buttons.
+   * Rejects unsafe or nonsensical actions before execution.
+
+6. **Executor (`agent_b/executor.py`)**
+
+   * Executes `click`, `fill`, `press`, `wait`, `capture`, etc.
+   * Waits for visibility and page stability.
+   * On each capture:
+
+     * Saves screenshot + metadata.
+   * Returns success/failure and updated context to the runner.
+
+7. **Success Detection (`agent_b/success.py`)**
+
+   * Intent-aware heuristics:
+
+     * For “create”:
+
+       * Form filled
+       * Submit/CTA clicked
+       * New entity visible
+   * Triggers `done` when conditions are satisfied and ensures final capture.
+
+8. **Memory (`plan_memory`, `experience_store`, `semantic_index`)**
+
+   * Stores successful trajectories.
+   * Uses them as hints for similar future tasks (while still validating live).
+
+---
+
+## Dataset Format
+
+All runs are **organized by task** so they satisfy:
+
+> “Captured UI states for 3–5 tasks across 1–2 apps, organized by task, with blurbs.”
+
+Example layout (conceptual):
+
+```text
+datasets/
+  linear/
+    create-project/
+      run.jsonl
+      step-00-entry.png
+      step-01-projects-page.png
+      step-02-create-modal-open.png
+      step-03-form-filled.png
+      step-04-success-or-confirmation.png
+    filter-issues-high-priority/
+      run.jsonl
+      step-*.png
+    notifications-settings/
+      run.jsonl
+      step-*.png
+  notion/
+    create-page-with-summary/
+      run.jsonl
+      step-*.png
+    filter-database-completed/
+      run.jsonl
+      step-*.png
+    workspace-settings-modal/
+      run.jsonl
+      step-*.png
 ```
 
-### Planner
-- Interprets the task + DOM summary using a strict system prompt.
-- Emits exactly one JSON object per step with fields such as `action`, `selector`, `value`, `capture_name`, `reason`, `expect`, `success_hint`.
-- Never emits Markdown, never pastes its instructions into input fields, and targets robust selectors (roles, aria labels, placeholders).
-- Encourages collecting ~3–6 captures per workflow (entry, control visible, modal open, form filled, success state).
+Each `run.jsonl` includes:
 
-### Executor
-- Implements `click`, `fill`, `press`, `wait_for`, `capture`, etc., via Playwright.
-- Waits for elements, retries on timeouts, surfaces structured success/failure info to the planner and logger.
+* `snapshot_hint` events (what the agent sees)
+* `step` events:
 
-### Context Extractor
-- Builds lightweight page/DOM summaries each loop (URL, title, clickables, inputs, breadcrumbs, modal metadata).
+  * planned action
+  * execution result
+  * references to captures
+* Optional console/page errors for debugging
 
-### Run Logger & Dataset
-- Logs each planner/executor step to `run.jsonl`.
-- Stores screenshots under `captures/<slugified-task>/<step>-<capture_name>.png`.
-- Produces `agent-<timestamp>.log` for debugging, plus high-level DOM summaries for downstream analysis.
+Each folder is a **self-contained workflow dataset** documenting how Agent B completed a specific task.
+
+---
+
+## Example Tasks Covered
+
+By design, the same agent handles multiple workflows across Linear and Notion using natural language instructions and live DOM inspection.
+
+### Linear (selected examples)
+
+* Create a new project and capture the confirmation modal
+* Create a new project in Linear (random title)
+* Filter issues to show only high priority items
+* Open workspace notification settings and toggle a switch
+* Navigate to roadmap via sidebar
+* Open command palette and search for integrations
+* Open create issue modal and capture it
+* Switch to “My Issues” and capture state
+* Open projects page and capture the “Add project” UI
+* Inspect notifications feed and capture state
+
+### Notion (selected examples)
+
+* Create a new page and add a short summary
+* Filter a database to show completed tasks
+* Open the quick find command palette
+* Duplicate the default meeting notes template
+* Create a new database view for tasks
+* Open workspace settings and capture the modal
+* Create a toggle list
+* Add a reminder to a block
+* Capture the share menu for the current page
+* Create a new database
+* Change database filters
+
+These tasks:
+
+* Are **not** hardcoded as flows in the code.
+* Are passed in as plain-text `--task` strings.
+* Demonstrate generalization across multiple workflows and non-URL states.
 
 ---
 
 ## Quickstart
 
 ### Prerequisites
-- Python 3.11
-- Node/npm (for Playwright helpers)
-- Playwright browsers (`chromium` at minimum)
 
-### Installation
+* Python 3.11+
+* Playwright installed + browsers:
+
+  ```bash
+  pip install -r requirements.txt
+  python -m playwright install
+  ```
+* Node/npm if you prefer to use `npx playwright` helpers.
+* Authenticated storage states:
+
+  * `secrets/linear-storage.json`
+  * `secrets/notion-storage.json`
+
+### Auth Setup (Example: Linear)
+
 ```bash
-git clone <repo>
-cd agent-ui-capture-intelligent
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install
+npx playwright codegen https://linear.app \
+  --save-storage=secrets/linear-storage.json
 ```
 
-### Auth Setup
-Capture a saved Playwright auth state for each app (Linear example):
-```bash
-npx playwright codegen https://linear.app --save-storage=secrets/linear-storage.json
-```
-Reuse the resulting `--storage-state` file for subsequent runs. Do the same for Notion or other apps.
+Log in once in the opened browser; the storage state is saved and reused.
 
-### Example Runs
-**Linear**
+Do the same for Notion (or your chosen apps), saving into `secrets/notion-storage.json`.
+
+---
+
+## Run a Single Task
+
+### Linear
+
 ```bash
 python src/main.py \
-  --task "Create a new project in Linear with a random title" \
+  --task "Create a new project in Linear with a random title and capture each step" \
   --app linear \
+  --browser firefox \
   --storage-state secrets/linear-storage.json \
-  --max-steps 18 \
-  --timeout-ms 12000
+  --max-steps 15 \
+  --timeout-ms 10000
 ```
 
-**Notion**
+### Notion
+
 ```bash
 python src/main.py \
   --task "Create a database and filtered view in Notion" \
   --app notion \
+  --browser firefox \
   --storage-state secrets/notion-storage.json \
-  --headless \
-  --max-steps 20
+  --max-steps 20 \
+  --timeout-ms 10000
 ```
+
+Each run:
+
+* Navigates the app based on the task.
+* Captures key UI states (including non-URL states).
+* Writes `run.jsonl` + screenshots/HTML into the appropriate dataset directory.
 
 ---
 
-## How It Works (Step-by-Step)
-1. **Task ingestion** – `src/main.py` parses CLI flags (`--task`, `--app`, `--storage-state`, `--max-steps`, `--timeout-ms`, `--headless`).
-2. **Context snapshot** – `src/agent/context.py` summarizes the live page: URL, title, clickables, inputs, modals, owner dialog info.
-3. **Planner call** – `LLMPlanner` (src/agent/planner.py) receives the DOM summary + task and returns one JSON action that fits the schema. It never emits extra text.
-4. **Executor** – `ActionExecutor` (src/agent/executor.py) maps the JSON to Playwright operations, waits for visibility, handles timeouts, and reports structured success/failure data.
-5. **Captures** – The executor triggers screenshots whenever the planner requests `capture` or when configured key states (modal open, form populated, success banner) are reached.
-6. **Logging** – `RunLogger` (src/agent/run_logger.py) writes every event to `run.jsonl`, captures step metadata, and mirrors console/page errors.
-7. **Stopping** – Loop ends when the planner outputs `done`, success heuristics fire, guardrails trip, or `--max-steps` is reached.
+## Run the Full Task Suite (Recommended for Dataset Generation)
 
-Because all captures are driven by context, Agent B records non-URL states—modals, wizards, confirmation banners—ensuring workflows remain reproducible even when the browser location stays constant.
+A helper script (e.g. `scripts/run_all_tasks.sh`) is included/outlined to generate multiple workflows across Linear and Notion.
 
----
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-## Dataset Format
-```
-captures/<slugified-task>/
-├── step-00-entry.png / .json
-├── step-01-open-control.png / .json
-├── step-02-modal-open.png / .json
-├── step-03-form-filled.png / .json
-├── step-04-success.png / .json
-└── run.jsonl
-```
+PYTHON=${PYTHON:-python}
+LINEAR_STATE=${LINEAR_STATE:-secrets/linear-storage.json}
+NOTION_STATE=${NOTION_STATE:-secrets/notion-storage.json}
 
-### run.jsonl (excerpt)
-```json
-{
-  "event": "step",
-  "step": 4,
-  "action": {
-    "action": "fill",
-    "selector": "role=textbox[name=/Project name/i]",
-    "value": "Agent Demo",
-    "capture_name": "form-filled",
-    "reason": "Populate project name",
-    "expect": "Form ready to submit",
-    "success_hint": "New project dialog still open"
-  },
-  "success": true,
-  "planner": "llm",
-  "url": "https://linear.app/.../projects",
-  "dom_summary": { "clickables": 42, "inputs": 6, "modals": 1 },
-  "screenshot": "captures/create-a-project/step-04-form-filled.png"
+run_task() {
+  local task="$1"
+  local app="$2"
+  local state="$3"
+  echo "=== Running: $task (app=${app:-none}) ==="
+  if [[ -n "$state" ]]; then
+    $PYTHON src/main.py \
+      --task "$task" \
+      ${app:+--app "$app"} \
+      --browser firefox \
+      --storage-state "$state" \
+      --max-steps 15 \
+      --timeout-ms 10000
+  else
+    $PYTHON src/main.py \
+      --task "$task" \
+      ${app:+--app "$app"} \
+      --browser firefox \
+      --max-steps 15 \
+      --timeout-ms 10000
+  fi
 }
+
+LINEAR_TASKS=(
+  "Create a new project and capture the confirmation modal"
+  "Filter issues to show only high priority items"
+  "Open workspace notification settings and toggle a switch"
+  "Navigate to the roadmap view using the sidebar"
+  "Open the command palette and search for integrations"
+  "Create a new view named Automation Board"
+  "Open the create issue modal and capture it"
+  "Switch to the My Issues tab and capture it"
+  "Open the projects page and capture the Add project modal"
+  "Inspect the notifications feed and capture its state"
+  "Create a new project in Linear"
+)
+
+NOTION_TASKS=(
+  "Create a new page and add a short summary"
+  "Filter a database to show completed tasks"
+  "Open the quick find command palette"
+  "Duplicate the default meeting notes template"
+  "Create a new database view for tasks"
+  "Open workspace settings and capture the modal"
+  "Create a toggle list on the current page"
+  "Add a reminder to the first block"
+  "Switch to the favorites section in the sidebar"
+  "Capture the share menu for the current page"
+  "Create a new Database in Notion"
+  "Change the database filter in Notion"
+)
+
+for task in "${LINEAR_TASKS[@]}"; do
+  run_task "$task" "linear" "$LINEAR_STATE"
+done
+
+for task in "${NOTION_TASKS[@]}"; do
+  run_task "$task" "notion" "$NOTION_STATE"
+done
 ```
 
-Use the `run.jsonl` timeline to correlate each action with its screenshot and DOM summary. This dataset becomes ground truth for training other agents or for documenting internal workflows.
+### How to Use
+
+```bash
+chmod +x scripts/run_all_tasks.sh
+./scripts/run_all_tasks.sh
+```
+
+This will:
+
+* Execute a rich set of workflows across Linear + Notion.
+* Produce **multiple task-organized datasets** with captured UI states.
+* Clearly demonstrate:
+
+  * 3–5+ workflows across 1–2 apps
+  * Thoughtful handling of non-URL states
+  * Generalization from natural language tasks
 
 ---
 
 ## Loom Demo
-- ▶ **Loom demo: <ADD_LINK_HERE>** – Walkthrough showing the agent receiving a Linear task, opening the modal, filling the form, capturing key UI states, and producing the dataset.
+
+Add a short Loom showcasing:
+
+* Running one or more tasks with `src/main.py` or `run_all_tasks.sh`
+* The agent:
+
+  * Navigating to the right pages
+  * Opening modals
+  * Filling forms
+  * Clicking the correct CTAs
+  * Capturing screenshots and producing `run.jsonl`
+* Where the outputs live in the repo / dataset
+
+**Placeholder:** `▶ Loom demo: <ADD_LINK_HERE>`
 
 ---
 
-## Testing Expectations
-The repository demonstrates 3–5 real tasks across at least two apps (e.g., Linear + Notion):
-1. Create a new project in Linear.
-2. Filter issues by status/label in Linear.
-3. Create a database and filtered view in Notion.
-4. Update workspace settings.
+## Reliability, Limitations & Extensibility
 
-No workflows are hardcoded—the agent always consumes `--task` at runtime. Because planning relies on textual roles/labels (not app-specific scripts), the approach generalizes to unseen tasks and apps so long as they expose accessible DOM metadata.
+**Reliability**
 
----
+* Per-action timeouts + global `--max-steps`
+* Selector + intent validation before execution
+* Loop detection, especially around repeated clicks
+* Defenses against echoing prompt text into UI fields
 
-## Extensibility
-- **Add new apps** – Provide an auth state and call `src/main.py --task "…" --app <new-app>`; the planner/executor automatically adapts to the DOM summary.
-- **Swap LLM providers** – Replace the OpenAI client inside `src/agent/planner.py` while preserving the JSON schema and prompt contract.
-- **Customize capture rules** – Adjust planner prompts or extend the executor to capture additional states (toasts, error banners, etc.).
+**Limitations**
 
----
+* UI/selector drift from app updates may require light tuning.
+* Auth states depend on session longevity.
 
-## Reliability & Guardrails
-- Per-action timeouts (`--timeout-ms`) and global loop limits (`--max-steps`).
-- Selector validation detects conflicting nouns (“issue” vs “project”) and rejects brittle CSS.
-- Repeated-action detection prevents loops (e.g., re-opening “Add project” repeatedly).
-- Prompt-injection defense: planner never mirrors its instructions into UI fields.
-- Executor verifies fill results and surfaces failures to trigger replanning.
+**Extensibility**
+
+* Add new apps by:
+
+  * Providing `--app <name>` and a corresponding auth state.
+  * Letting the existing perception/planning pipeline operate on the new DOM.
+* Swap or upgrade LLMs inside `llm_planner` without changing overall contracts.
+* Extend capture logic for toasts, error banners, or additional metadata.
 
 ---
 
-## Limitations & Future Work
-- Third-party UIs change frequently; some selectors may degrade over time.
-- Auth/session management depends on upstream rate limits and cookie TTLs.
-- Future enhancements: cached multi-step plans, richer DOM embeddings, human-in-the-loop annotations for rare workflows.
+## Personal Note
 
----
+I’m genuinely excited about this challenge and the chance to work with the Softlight team.
 
-## Personal Note:
-I’m genuinely excited about this challenge and the opportunity to work with the Softlight team. It sits in the perfect intersection of what I love building: high-leverage systems, real-time automation, and intelligent tooling that makes complex workflows feel effortless. Over the past few years I’ve shipped production-grade platforms across infra, data, AI, and full-stack product — from low-latency systems and containerized backends to retrieval and analytics tooling — and this assignment feels like a natural extension of that work: robust engineering + ML-driven reasoning + delightful UX for other agents and humans. 
+This project is built to reflect how I like to engineer systems:
 
-What excites me most is Softlight’s focus on real, working systems over just “demo AI.” This project is exactly that: an autonomous, explainable agent that can generalize across products, navigate messy UIs, and reliably capture the right states without brittle hardcoding. It’s the kind of problem where strong fundamentals, meticulous debugging, and product empathy actually matter — and that’s how I like to operate.
+* clear separation of perception, planning, execution, and memory,
+* strong guardrails around an LLM core,
+* and a focus on **real**, end-to-end workflows instead of toy demos.
 
-I’m looking forward to the chance to collaborate with the team, go deep on this problem space, and help build tools that other engineers and agents can rely on in production.
+The idea of turning messy, dynamic web UIs into reliable, re-usable, agent-friendly workflows is exactly the kind of problem I want to work on—combining practical automation, solid infra, and intelligent tooling that other engineers (and agents) can trust.
+
+Looking forward to the opportunity to take this further with you.
