@@ -1,147 +1,197 @@
-Agent B: Perception-Driven UI Agent
-===================================
+# Agent B – UI Workflow Capture Agent
+*Softlight Engineering Take-Home Assignment – UI Workflow Capture Agent (Agent B)*
 
-Agent B turns natural-language requests into reliable UI automations by looping through **Perception → Decision → Action → Capture** inside a real browser. Every iteration inspects the live DOM, picks exactly one JSON action (`goto`, `click`, `fill`, `press`, `wait_for`, `capture`, or `done`), executes it with robust Playwright helpers, then captures evidence before reasoning about the next move. There are **no hand-authored workflows** or app-specific selectors—plans are grounded entirely in the current UISnapshot plus the user’s instruction.
+---
 
+## Overview
+Agent B collaborates with other members of Softlight’s multi-agent system. Agent A receives natural-language questions (“How do I create a project in Linear?”) and delegates them to Agent B. Agent B interprets the instruction, drives a real browser via Playwright + an LLM planner, captures every important UI state (including modals and confirmation banners that never change the URL), and emits a structured dataset that teaches downstream agents or humans how to complete the workflow.
 
-Quick Start
------------
+---
 
-Requirements: Python 3.9+, Playwright browsers, an OpenAI API key (for the LLM planner; heuristics work without it).
+## Key Features
+- **LLM Planner** – Strict JSON schema, robust selector guidance, loop-safe reasoning, and capture hints for all key states.
+- **Playwright Executor** – Sync Playwright driver that validates visibility, handles retries/timeouts, and converts actions to real DOM operations.
+- **Non-URL Capture** – Records entry pages, controls, modals/forms, populated inputs, success views—everything Agent A needs to replicate the workflow.
+- **Dataset Generation** – Saves sequential screenshots, DOM summaries, and `run.jsonl` telemetry under `captures/<task>/`.
+- **Guardrails** – Per-action timeouts, repeated-action detection, selector validation, and “never paste the prompt” policies keep the system reliable.
 
+---
+
+## Architecture
+```
+┌───────────────────────────────────────────────────────────────┐
+│                          Agent B                              │
+├──────────────────────┬────────────────────────┬───────────────┤
+│ Context Extractor    │ Planner                │ Executor      │
+│ (src/agent/context.py│ (src/agent/planner.py) │ (src/agent/   │
+│ + Playwright DOM     │ • strict system prompt │ executor.py)  │
+│ snapshot)            │ • JSON-only actions    │ • Playwright   │
+│ • URL/title/modals   │ • capture recommendations│ ops + waits  │
+│ • Clickables/inputs  │ • guardrails + retries │ • success/fail │
+├──────────────────────┴────────────────────────┴───────────────┤
+│ Run Logger & Dataset (src/agent/run_logger.py)                │
+│ • logs/agent-<ts>.log + logs/run-<ts>.jsonl                   │
+│ • captures/<slug>/<step>-<capture>.png                        │
+│ • Combined trace feeds Agent A and future training pipelines  │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Planner
+- Interprets the task + DOM summary using a strict system prompt.
+- Emits exactly one JSON object per step with fields such as `action`, `selector`, `value`, `capture_name`, `reason`, `expect`, `success_hint`.
+- Never emits Markdown, never pastes its instructions into input fields, and targets robust selectors (roles, aria labels, placeholders).
+- Encourages collecting ~3–6 captures per workflow (entry, control visible, modal open, form filled, success state).
+
+### Executor
+- Implements `click`, `fill`, `press`, `wait_for`, `capture`, etc., via Playwright.
+- Waits for elements, retries on timeouts, surfaces structured success/failure info to the planner and logger.
+
+### Context Extractor
+- Builds lightweight page/DOM summaries each loop (URL, title, clickables, inputs, breadcrumbs, modal metadata).
+
+### Run Logger & Dataset
+- Logs each planner/executor step to `run.jsonl`.
+- Stores screenshots under `captures/<slugified-task>/<step>-<capture_name>.png`.
+- Produces `agent-<timestamp>.log` for debugging, plus high-level DOM summaries for downstream analysis.
+
+---
+
+## Quickstart
+
+### Prerequisites
+- Python 3.11
+- Node/npm (for Playwright helpers)
+- Playwright browsers (`chromium` at minimum)
+
+### Installation
 ```bash
+git clone <repo>
 cd agent-ui-capture-intelligent
-python -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install
 ```
 
-Basic CLI usage (always run from the repository root):
-
+### Auth Setup
+Capture a saved Playwright auth state for each app (Linear example):
 ```bash
-OPENAI_API_KEY=sk-... python src/main.py \
-  --task "Create a new project named Agent Project in Linear" \
+npx playwright codegen https://linear.app --save-storage=secrets/linear-storage.json
+```
+Reuse the resulting `--storage-state` file for subsequent runs. Do the same for Notion or other apps.
+
+### Example Runs
+**Linear**
+```bash
+python src/main.py \
+  --task "Create a new project in Linear with a random title" \
   --app linear \
-  --storage-state path/to/linear.json \
+  --storage-state secrets/linear-storage.json \
   --max-steps 18 \
   --timeout-ms 12000
 ```
 
-Other helpful commands:
-
-| Scenario | Command |
-| --- | --- |
-| Headless smoke test | `python src/main.py --task "Smoke test navigation" --headless --max-steps 5` |
-| Reuse a persistent browser profile | `python src/main.py ... --profile-dir profiles/linear` |
-| Run unit tests | `pytest tests/test_task_graphs.py` |
-
-
-How It Works
-------------
-
-### Perception
-
-`ui_describer.describe_ui` gathers a condensed UISnapshot from the page (and visible iframes):
-
-* URL, title, detected app hints.
-* Up to 60 clickables, 30 inputs, modals + overlays, breadcrumbs, and “primary action” candidates.
-* Rich metadata for each element (text, role, aria labels, owner dialog/menu ancestry, state flags, etc.).
-
-This structured view is the sole source of truth for planners—no hidden selectors or app-specific shortcuts exist.
-
-### Decision
-
-`HierarchicalPlanner` coordinates three planning stages, always emitting a single JSON action per loop:
-
-1. **Memory/script replay** – successful action traces from previous runs can be re-used when selectors remain reliable.
-2. **LLM planning** – `LLMPlanner` generates either a short script or a single action entirely from the live UISnapshot. Responses are validated against snapshot affordances and the parsed intent before execution.
-3. **Heuristic fallback** – `HeuristicPlanner` keeps the loop progressing without model access by scoring visible affordances using intent cues (verbs, nouns, modals, destructive dialogs, etc.).
-
-The planner also enforces safety rails:
-
-* Validation rejects selectors that are missing, conflicting (e.g., clicking “Create issue” while the task targets “project”), or illegal for the requested intent.
-* When a creation modal is open and an explicit title was filled, the planner will automatically fire the modal’s `Create/Add` button instead of letting scripts re-trigger background launchers.
-* Self-healing avoids selectors that recently failed and skips unreliable ones remembered across runs.
-
-### Action & Robustness
-
-`executor.run_step` applies the chosen action with Playwright and always captures the outcome:
-
-* `click_robust` and `fill_robust` re-query locators, scroll into view, retry with exponential backoff, and verify input state. Non-fillable elements raise `NonFillableElementError` so the planner can re-plan safely.
-* Every action gets a PNG, DOM HTML, and JSON metadata capture stored under `datasets/<app>/<task-slug>/step-XX-*`.
-* Telemetry for each step (planner source, selector, success flag, console/page errors) streams into `run.jsonl`.
-
-### Capture & Success Detection
-
-After each step, `success.evaluate_success` examines the latest snapshot/history to decide whether the task is done. Success heuristics stay generic—looking for modal titles, toggled switches, new artifact headings, etc.—and they never accept destructive dialogs as proof for create/open intents. When success is detected, the runner logs `{"event":"success", ...}`, emits a final `done` action with a “success-state” capture, and stores the verified script for future warm starts.
-
-
-Project Layout
---------------
-
-```
-agent-ui-capture-intelligent/
-├── src/
-│   └── agent_b/
-│       ├── main.py / runner.py        # CLI entry + Perception→Decision→Action→Capture loop
-│       ├── perception.py / ui_describer.py
-│       ├── hierarchical_planner.py / llm_planner.py / heuristic_planner.py
-│       ├── planning_validation.py     # Selector + intent safety checks
-│       ├── executor.py / robustness.py
-│       ├── success.py                 # Intent-aware success signals
-│       └── … (experience_store, memory, config, etc.)
-├── datasets/<app>/<task-slug>/        # PNG/HTML/JSON artifacts + run.jsonl telemetry
-├── logs/                              # Structured planner/executor logs
-└── tests/                             # Lightweight structural tests (pytest)
+**Notion**
+```bash
+python src/main.py \
+  --task "Create a database and filtered view in Notion" \
+  --app notion \
+  --storage-state secrets/notion-storage.json \
+  --headless \
+  --max-steps 20
 ```
 
+---
 
-Running Tasks & Inspecting Output
----------------------------------
+## How It Works (Step-by-Step)
+1. **Task ingestion** – `src/main.py` parses CLI flags (`--task`, `--app`, `--storage-state`, `--max-steps`, `--timeout-ms`, `--headless`).
+2. **Context snapshot** – `src/agent/context.py` summarizes the live page: URL, title, clickables, inputs, modals, owner dialog info.
+3. **Planner call** – `LLMPlanner` (src/agent/planner.py) receives the DOM summary + task and returns one JSON action that fits the schema. It never emits extra text.
+4. **Executor** – `ActionExecutor` (src/agent/executor.py) maps the JSON to Playwright operations, waits for visibility, handles timeouts, and reports structured success/failure data.
+5. **Captures** – The executor triggers screenshots whenever the planner requests `capture` or when configured key states (modal open, form populated, success banner) are reached.
+6. **Logging** – `RunLogger` (src/agent/run_logger.py) writes every event to `run.jsonl`, captures step metadata, and mirrors console/page errors.
+7. **Stopping** – Loop ends when the planner outputs `done`, success heuristics fire, guardrails trip, or `--max-steps` is reached.
 
-1. Execute `src/main.py` with your task, providing either `--storage-state` or `--profile-dir` so Linear/Notion sessions stay authenticated.
-2. After the run, open `datasets/<app>/<task-slug>/run.jsonl` to review the timeline. Each `step` entry includes the planner source, selector, success flag, and capture filenames.
-3. Look at `step-XX-*.png` / `.html` to debug mis-clicks or confirm success-state captures.
+Because all captures are driven by context, Agent B records non-URL states—modals, wizards, confirmation banners—ensuring workflows remain reproducible even when the browser location stays constant.
 
-Tips:
+---
 
-* Use `--max-steps` and `--timeout-ms` to tune exploration depth vs. responsiveness.
-* When iterating on planners, delete just the failing dataset folder so new captures don’t mix with old runs.
+## Dataset Format
+```
+captures/<slugified-task>/
+├── step-00-entry.png / .json
+├── step-01-open-control.png / .json
+├── step-02-modal-open.png / .json
+├── step-03-form-filled.png / .json
+├── step-04-success.png / .json
+└── run.jsonl
+```
 
+### run.jsonl (excerpt)
+```json
+{
+  "event": "step",
+  "step": 4,
+  "action": {
+    "action": "fill",
+    "selector": "role=textbox[name=/Project name/i]",
+    "value": "Agent Demo",
+    "capture_name": "form-filled",
+    "reason": "Populate project name",
+    "expect": "Form ready to submit",
+    "success_hint": "New project dialog still open"
+  },
+  "success": true,
+  "planner": "llm",
+  "url": "https://linear.app/.../projects",
+  "dom_summary": { "clickables": 42, "inputs": 6, "modals": 1 },
+  "screenshot": "captures/create-a-project/step-04-form-filled.png"
+}
+```
 
-Testing & Quality Gates
------------------------
+Use the `run.jsonl` timeline to correlate each action with its screenshot and DOM summary. This dataset becomes ground truth for training other agents or for documenting internal workflows.
 
-* Unit / structural tests: `pytest tests/test_task_graphs.py`
-* Manual smoke tests: run representative CLI commands (Linear create, Notion toggles, etc.) with `--headless` to catch regressions quickly.
-* Linting/formatting: this repo relies on `pyproject` defaults; ensure your editor keeps files ASCII-only unless the source already contains Unicode.
+---
 
+## Loom Demo
+- ▶ **Loom demo: <ADD_LINK_HERE>** – Walkthrough showing the agent receiving a Linear task, opening the modal, filling the form, capturing key UI states, and producing the dataset.
 
-Security & Data Hygiene
------------------------
+---
 
-* Never commit `.env`, `profiles/`, raw `datasets/`, or secrets to version control.
-* Scrub real customer data before sharing captures. Synthetic samples belong under `tests/samples/`.
-* Supply `OPENAI_API_KEY` via environment variables (or skip it entirely to use the heuristic planner).
+## Testing Expectations
+The repository demonstrates 3–5 real tasks across at least two apps (e.g., Linear + Notion):
+1. Create a new project in Linear.
+2. Filter issues by status/label in Linear.
+3. Create a database and filtered view in Notion.
+4. Update workspace settings.
 
+No workflows are hardcoded—the agent always consumes `--task` at runtime. Because planning relies on textual roles/labels (not app-specific scripts), the approach generalizes to unseen tasks and apps so long as they expose accessible DOM metadata.
 
-Troubleshooting
----------------
+---
 
-| Symptom | Likely Cause / Fix |
-| --- | --- |
-| Planner keeps reopening “Add project” instead of submitting | Ensure the creation modal is visible; the built-in modal submit override triggers only after the explicit title fill succeeds. |
-| Agent stalls on login screens | Provide `--storage-state` or `--profile-dir`; otherwise the snapshot will keep showing email/password inputs. |
-| Playwright errors about missing browsers | Re-run `python -m playwright install` in the repo’s virtualenv. |
+## Extensibility
+- **Add new apps** – Provide an auth state and call `src/main.py --task "…" --app <new-app>`; the planner/executor automatically adapts to the DOM summary.
+- **Swap LLM providers** – Replace the OpenAI client inside `src/agent/planner.py` while preserving the JSON schema and prompt contract.
+- **Customize capture rules** – Adjust planner prompts or extend the executor to capture additional states (toasts, error banners, etc.).
 
+---
 
-Contributing
-------------
+## Reliability & Guardrails
+- Per-action timeouts (`--timeout-ms`) and global loop limits (`--max-steps`).
+- Selector validation detects conflicting nouns (“issue” vs “project”) and rejects brittle CSS.
+- Repeated-action detection prevents loops (e.g., re-opening “Add project” repeatedly).
+- Prompt-injection defense: planner never mirrors its instructions into UI fields.
+- Executor verifies fill results and surfaces failures to trigger replanning.
 
-1. Create a feature branch.
-2. Keep changes modular, add inline comments only for non-obvious heuristics.
-3. Run the relevant CLI smoke tests + `pytest`.
-4. Update this README or docs if behavior changes (e.g., new planner safeguards).
-5. Use imperative commit messages (`feat:`, `fix:`, `chore:`) and include reproduction commands in your PR description.
+---
 
-Agent B stays intentionally app-agnostic: any improvement should continue to rely on the live UISnapshot and natural-language intent—not on hardcoded URLs, product-specific logic, or cached scripts that were not produced by real UI runs.
+## Limitations & Future Work
+- Third-party UIs change frequently; some selectors may degrade over time.
+- Auth/session management depends on upstream rate limits and cookie TTLs.
+- Future enhancements: cached multi-step plans, richer DOM embeddings, human-in-the-loop annotations for rare workflows.
+
+---
+
+## License
+MIT License © Softlight Engineering. Use responsibly; never commit secrets, storage-state files, or raw customer datasets to the repository.
+
+Agent B is intentionally app-agnostic—every improvement should continue to rely on live UISnapshots and natural-language instructions rather than hardcoded flows. Hook it up to Agent A, point it at a new workflow, and you’ll get the screenshots, actions, and metadata needed to teach the rest of your agent stack.
