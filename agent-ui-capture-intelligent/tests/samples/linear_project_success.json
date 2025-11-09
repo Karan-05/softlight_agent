@@ -1,0 +1,38 @@
+{
+  "task": "Create a new project in Linear",
+  "app": "linear",
+  "workflow": "linear.create_project",
+  "steps": [
+    {
+      "id": "project-0-prepare",
+      "tool": "linear.projects.prepare_surface",
+      "status": "success",
+      "metadata": {"slug": "example-team"}
+    },
+    {
+      "id": "project-0-open",
+      "tool": "linear.projects.open_modal",
+      "status": "success",
+      "metadata": {"selector": "[data-test-id='projects-list-page__create-button']"}
+    },
+    {
+      "id": "project-0-fill",
+      "tool": "linear.projects.fill_form",
+      "status": "success",
+      "metadata": {"selector": "div[contenteditable='true'][aria-label='Project name']"}
+    },
+    {
+      "id": "project-0-submit",
+      "tool": "linear.projects.submit_form",
+      "status": "success",
+      "metadata": {"selector": "button:has-text('Create project')"}
+    },
+    {
+      "id": "project-0-verify",
+      "tool": "linear.projects.verify_creation",
+      "status": "success",
+      "metadata": {"project": "Agent Project QWERTY"}
+    }
+  ],
+  "captures_dir": "datasets/linear/create-a-new-project-in-linear"
+}

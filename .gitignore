@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+.DS_Store
+agent-ui-capture-intelligent/.env
+agent-ui-capture-intelligent/.playwright-browsers/
+agent-ui-capture-intelligent/datasets/
+agent-ui-capture-intelligent/logs/
+agent-ui-capture-intelligent/profiles/
+agent-ui-capture-intelligent/secrets/
+agent-ui-capture-intelligent/ms-playwright-cache/
+agent-ui-capture-intelligent/playwright
+agent-ui-capture-intelligent/linear-storage.json
+agent-ui-capture-intelligent/linear-

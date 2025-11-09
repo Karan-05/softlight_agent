@@ -1,0 +1,30 @@
+{
+  "task": "Create two projects in Linear",
+  "app": "linear",
+  "workflow": "linear.create_project",
+  "events": [
+    {
+      "step": "project-0-open",
+      "status": "failed",
+      "error": "Selector [data-test-id='project-create-button'] not visible",
+      "resolution": "retry"
+    },
+    {
+      "step": "project-0-open",
+      "status": "success",
+      "notes": "Recovered after dismissing overlays"
+    },
+    {
+      "step": "project-1-submit",
+      "status": "failed",
+      "error": "Toast not detected after submit",
+      "resolution": "replan"
+    },
+    {
+      "step": "project-1-submit",
+      "status": "success",
+      "notes": "Replan swapped to keyboard shortcut path"
+    }
+  ],
+  "captures_dir": "datasets/linear/create-two-projects-in-linear"
+}
